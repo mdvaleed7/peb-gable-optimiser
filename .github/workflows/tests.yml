@@ -1,0 +1,28 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.12", "3.14"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -r requirements.txt
+      - name: is800 hand checks
+        run: python is800.py
+      - name: model checks (closed form, statics, sign conventions)
+        run: python test_model.py
+      - name: optimiser checks (P-Delta, search, stiffeners, crane, export, trusses)
+        run: python test_optimiser.py
+      - name: deployment self-test (catalogues, all schemes, 2-process optimisation)
+        run: python app.py --selftest
