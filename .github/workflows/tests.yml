@@ -26,7 +26,5 @@ jobs:
         run: python test_optimiser.py
       - name: deployment self-test (catalogues, all schemes, 2-process optimisation)
         run: python app.py --selftest
-      - name: demo model generator (STAAD files, station map, preview)
-        run: python demo_two_span.py "${{ runner.temp }}/demo_out"
-      - name: OpenSTAAD runner compiles (needs STAAD on Windows to run)
-        run: python -m py_compile openstaad_runner.py
+      - name: OpenSTAAD runner data path on a mock STAAD (runs demo_two_span.py)
+        run: python test_runner_plumbing.py
