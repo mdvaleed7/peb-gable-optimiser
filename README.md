@@ -102,6 +102,16 @@ loads on columns, stiffener eccentricity moment of single-sided stiffeners (smal
 members, none on tapered ones - this reproduces STAAD: prismatic frame 1.93 % -> 0.09 % moment difference,
 tapered demo 0.54 % either way (STAAD's tapered stiffness evidently omits shear deformation).
 
+**Run time** (Limits tab): crane frames have hundreds of ULS combinations (238 in the crane demo) but few govern.
+`options.screen_combos` (default on, used when there are more than 40): the search analyses each trial design
+for the governing combinations only (those that govern any station in a full check, plus the gravity-only
+ones); every design it accepts is checked with all combinations, and newly governing ones join the screen.
+Same result as before on the crane demo PEB (4870.6 kg), 225 full + 5386 screened analyses instead of 5387 full,
+3x faster; the three crane schemes take about 9 min each on 2 cores. `limits.time_limit_min` (default 60 per
+scheme, 0 = none) stops the search and keeps the best feasible design found. Each worker process uses one BLAS
+thread (OpenBLAS, Intel MKL as in Anaconda, OpenMP, Accelerate - all forced to 1): a multithreaded BLAS in every
+worker oversubscribes the CPU, measured 100x slower (4 workers x 4 threads) - the likely cause of day-long runs.
+
 **Optimisation problem** (full statement in the optimiser.py docstring):
 min f(x) = steel weight + stiffener mass + penalty x n_stiffeners, over catalogue indices x
 s.t. IS 800 D/C <= eta at every station and combination; SLS ratios <= 1; stiffener F/Fqd <= 1;

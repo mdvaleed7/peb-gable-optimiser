@@ -58,8 +58,17 @@ import subprocess
 import time
 from pathlib import Path
 
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")   # ~150-DOF solves: thread start-up cost 50x the solve
+# One BLAS thread per process: the solves are small (~150-500 DOF) and the search already runs one process
+# per core; a multithreaded BLAS in every worker (OpenBLAS / Intel MKL, e.g. Anaconda's numpy, / OpenMP /
+# Apple Accelerate) oversubscribes the CPU - measured 100x slower (4 workers x 4 BLAS threads).
+for _v in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "OMP_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ[_v] = "1"
 import numpy as np                                    # noqa: E402
+try:                                                  # numpy already loaded by the caller: limit it at runtime
+    from threadpoolctl import threadpool_limits       # noqa: E402
+    threadpool_limits(1)
+except ImportError:
+    pass
 from scipy.linalg import LinAlgError, cho_factor, cho_solve, eigh  # noqa: E402
 
 from is800 import (GM0, angle_capacities, angle_ratios, capacities, double_angle, end_post, ratios, shear_capacity,
@@ -155,9 +164,11 @@ DEFAULT_INPUT = dict(
                  tension_field=False,    # True: 8.4.2.2(b) in anchored stiffened panels (needs stiffeners)
                  end_posts=False,        # True: 8.5.2(b) end posts let knee / haunch panels use tension field
                  constant_bf=True,       # practical: one flange width per template (member)
-                 rafter_six_sections=True),  # six tapered sections from the moment envelope, shape rules
+                 rafter_six_sections=True,   # six tapered sections from the moment envelope, shape rules
+                 screen_combos=True),        # search screens with the governing ULS combinations (> 40 combinations)
     limits=dict(dc_target=1.0, rafter_defl=180.0, eave_drift=150.0, crane_drift=200.0, rail_spread_mm=10.0,
-                taper_max=150.0),     # mm depth change per m, six-section segments outside the haunch segment
+                taper_max=150.0,      # mm depth change per m, six-section segments outside the haunch segment
+                time_limit_min=60.0),  # per scheme: stop and keep the best feasible design found (0 = no limit)
     # knots: s/L along the template; D in mm at each knot; plates [tw, bf, tf] mm per segment
     templates=dict(
         raf_ext=dict(knots=[0, 0.1, 0.2, 0.35, 0.55, 0.75, 1], D=[800, 700, 600, 450, 450, 500, 550],
@@ -327,7 +338,7 @@ def restraint_lengths(mdl: FrameModel, fly_every: int, K: float = 1.0, bot_every
 K_STIFF = (1, 2, 3)     # stiffener spacing c = sub-member length / k  (k = 1: at the purlin / girt stations)
 
 
-def check_design(mdl: FrameModel, inp: dict, ends, disp, stiff: dict | None = None, posts=None) -> dict:
+def check_design(mdl: FrameModel, inp: dict, ends, disp, stiff: dict | None = None, posts=None, uls=None) -> dict:
     """ends(lc) -> {member: (start[6], end[6])} STAAD local, second order; disp(lc) -> {node: (ux, uy)} m.
     Each sub-member is one decision: k (stiffeners at spacing L/k, 0 = none) and the shear method, 8.4.2.2(a)
     simple post-critical or (b) tension field. The cheapest passing choice is taken in the order
@@ -346,7 +357,7 @@ def check_design(mdl: FrameModel, inp: dict, ends, disp, stiff: dict | None = No
     sw, st_on, tf_on = slender_web(inp), stiffeners_on(inp), tension_field_on(inp)
     knee = {ln["name"]: knee_ends(mdl, ln) for ln in mdl.lines} if end_posts_on(inp) else {}
     Ls = restraint_lengths(mdl, int(inp["restraint"]["fly_every"]), *_truss_lengths(inp))
-    E = {c["lc"]: ends(c["lc"]) for c in mdl.uls}
+    E = {c["lc"]: ends(c["lc"]) for c in (mdl.uls if uls is None else uls)}
     pts = {m["id"]: [(j, N, V, M, lc) for lc, Ec in E.items() for j, N, V, M in end_forces_to_stations(m, *Ec[m["id"]])]
            for m in mdl.members}
     pts_all = pts
@@ -711,12 +722,15 @@ def _fail(msg: str) -> dict:
     return dict(ok=False, weight=1e9, cost=1e9, max_ratio=99.0, viol=1e6, rows=[], error=msg)
 
 
-def evaluate(inp: dict, design: dict) -> dict:
-    """P-Delta analysis of every ULS combo + IS 800 checks. Never raises for a bad design (ratio 99)."""
+def evaluate(inp: dict, design: dict, only=None) -> dict:
+    """P-Delta analysis of every ULS combo + IS 800 checks. Never raises for a bad design (ratio 99).
+    only: ULS combination numbers to analyse (screening in the search; the result is then 'screened' and
+    every design the search accepts is re-checked with all combinations)."""
     try:
         mdl = FrameModel(frame_input(inp, design))
     except ValueError as ex:
         return _fail(str(ex))
+    uls = mdl.uls if only is None else [c for c in mdl.uls if c["lc"] in only]
     fe = LinearFrame2D(mdl, shear=True)                                # web shear deformation, as STAAD
     mids = [m["id"] for m in mdl.members]
     need = sorted({lc for c in mdl.uls + mdl.sls for lc, _ in c["pairs"]})
@@ -755,14 +769,14 @@ def evaluate(inp: dict, design: dict) -> dict:
         out[:, :, [0, 1, 5]] = f.reshape(-1, 2, 3)
         return out
 
-    uls_prim = sorted({lc for c in mdl.uls for lc, _ in c["pairs"]})
+    uls_prim = sorted({lc for c in uls for lc, _ in c["pairs"]})
     Ff = {lc: Kff @ U[lc][free] for lc in uls_prim}
     FEF = {}
     for lc in uls_prim:
         f = np.array([sol[lc]["ends"][mid] for mid in mids])[:, :, [0, 1, 5]].reshape(-1, 6)
         FEF[lc] = f - np.einsum("eij,ej->ei", Kl, local(U[lc]))
     E2 = {}
-    for c in mdl.uls:                                                   # P-Delta, N iterated
+    for c in uls:                                                       # P-Delta, N iterated
         F = sum(f * Ff[lc] for lc, f in c["pairs"])
         fef = sum(f * FEF[lc] for lc, f in c["pairs"])
         N = np.zeros(len(mids))                                         # first pass = first order
@@ -779,7 +793,7 @@ def evaluate(inp: dict, design: dict) -> dict:
             N = f[:, 0]
         E2[c["lc"]] = to_ends(f)
     lam = {}
-    for c in mdl.uls:                                                   # K phi = lambda Kg phi
+    for c in uls:                                                       # K phi = lambda Kg phi
         if c["gravity_only"]:
             N = E2[c["lc"]][:, 0, 0]
             mu = eigh(kg(N), Kff, eigvals_only=True, subset_by_index=[nf - 1, nf - 1])[0]
@@ -794,7 +808,7 @@ def evaluate(inp: dict, design: dict) -> dict:
         return {nd: arr[i, :2] for i, nd in enumerate(fe.ids)}
 
     try:
-        res = check_design(mdl, inp, ends, disp)
+        res = check_design(mdl, inp, ends, disp, uls=uls)
     except ValueError as ex:
         return _fail(str(ex))
     w = mdl.steel_weight()
@@ -802,7 +816,8 @@ def evaluate(inp: dict, design: dict) -> dict:
     weight = sum(w.values()) + sm["mass"]
     pen = float(inp.get("options", {}).get("stiffener_penalty_kg", 0.0))
     res.update(ok=res["viol"] <= 0, weight=weight, cost=weight + pen * sm["n"], line_mass=w, lam_cr=lam,
-               lam_cr_gravity=min(lam.values()) if lam else math.inf, model=mdl, ends=E2, mids=mids)
+               lam_cr_gravity=min(lam.values()) if lam else math.inf, model=mdl, ends=E2, mids=mids,
+               screened=only is not None)
     return res
 
 
@@ -1041,8 +1056,8 @@ def decode(inp: dict, var: list, x: list, T: dict | None = None) -> dict:
 
 def _eval_stripped(args):
     """Worker: evaluate without the (unpicklable-heavy) model object."""
-    inp, design = args
-    r = evaluate(inp, design)
+    inp, design, only = args
+    r = evaluate(inp, design, only)
     for k in ("model", "ends", "mids"):
         r.pop(k, None)
     return r
@@ -1054,6 +1069,14 @@ def optimise(inp: dict, start: dict | None = None, log=print, stop=lambda: False
     Six-section rafters: knots from the start design's moment envelope, search, knots re-derived from the result's
     envelope and, if they moved, one more search from there."""
     t0 = time.time()
+    limit = 60.0 * float(inp.get("limits", {}).get("time_limit_min", 0) or 0)
+    user_stop, said = stop, []
+
+    def stop():                                    # user Stop, or the time limit: keep the best feasible design so far
+        if limit and time.time() - t0 > limit and not said:
+            said.append(1)
+            log(f"time limit {limit / 60:g} min reached - finishing with the best feasible design found")
+        return user_stop() or bool(limit and time.time() - t0 > limit)
     tpls = active_templates(inp)
     start = {t: copy.deepcopy((start or {}).get(t, inp["templates"][t])) for t in tpls}
     six = six_on(inp) and any(t in SIX for t in tpls)
@@ -1090,25 +1113,49 @@ def _search(inp: dict, start: dict, log, stop, shake_passes, workers) -> dict:
     def canon(y):                                          # projected (shape rules) catalogue indices
         return encode(inp, decode(inp, var, list(y), start), var)
     x = canon(encode(inp, start, var))
-    memo = {}
+    memo = {}                                              # full checks (all ULS combinations)
     workers = workers or max(1, (os.cpu_count() or 2) - 1)
     pool = ProcessPoolExecutor(workers) if workers > 1 else None
+    # Combination screening: neighbour scans analyse only the ULS combinations that govern some station
+    # (plus the gravity-only ones); a design is accepted only after a full check with every combination,
+    # whose governing combinations join the screen. Crane frames have hundreds of combinations, few govern.
+    mdl0 = FrameModel(frame_input(inp, decode(inp, var, list(x), start)))
+    uls_all = {c["lc"] for c in mdl0.uls}
+    screen = {"on": len(uls_all) > 40 and inp.get("options", {}).get("screen_combos", True),
+              "active": {c["lc"] for c in mdl0.uls if c["gravity_only"]}, "ver": 0}
+    smemo = {}
 
-    def fmany(xs):
+    def learn(r):
+        new = {row["lc"] for row in r.get("rows", ()) if row.get("lc") in uls_all} - screen["active"]
+        if new:
+            screen["active"] |= new
+            screen["ver"] += 1
+
+    def fmany(xs, full=False):
         nonlocal pool
-        todo = list(dict.fromkeys(tuple(y) for y in xs if tuple(y) not in memo))
-        args = [(inp, decode(inp, var, list(k), start)) for k in todo]
+        scr = screen["on"] and not full
+        key = (lambda y: (tuple(y), screen["ver"])) if scr else (lambda y: tuple(y))
+        store = smemo if scr else memo
+
+        def have(y):
+            return tuple(y) in memo or key(y) in store
+        todo = list(dict.fromkeys(tuple(y) for y in xs if not have(y)))
+        only = frozenset(screen["active"]) if scr else None
+        args = [(inp, decode(inp, var, list(k), start), only) for k in todo]
         try:
             res = list(pool.map(_eval_stripped, args)) if pool else list(map(_eval_stripped, args))
         except BrokenProcessPool:                     # e.g. caller has no importable __main__
             log("  worker processes failed - continuing in-process")
             pool = None
             res = list(map(_eval_stripped, args))
-        memo.update(zip(todo, res))
-        return [memo[tuple(y)] for y in xs]
+        for k, rr in zip(todo, res):
+            store[key(k)] = rr
+            if not scr:
+                learn(rr)
+        return [memo.get(tuple(y)) or store[key(y)] for y in xs]
 
     def f(x):
-        return fmany([x])[0]
+        return fmany([x], full=True)[0]
 
     def step(x, i, d):
         return canon(x[:i] + [x[i] + d] + x[i + 1:])
@@ -1142,6 +1189,8 @@ def _search(inp: dict, start: dict, log, stop, shake_passes, workers) -> dict:
                     if ry["viol"] >= r["viol"] or (r["viol"] - ry["viol"]) / max(ry["cost"] - r["cost"], 0.5) < best_score / 2:
                         break
                     x, r, n_ok = y, ry, n_ok + 1
+                if r.get("screened"):
+                    r = f(x)                                              # full check of the accepted step
                 if not ys or n_ok < len(ys):
                     break
             log(f"  repair  {r['weight']:8.1f} kg  max D/C {r['max_ratio']:.3f}  violation {r['viol']:.3f}")
@@ -1153,17 +1202,24 @@ def _search(inp: dict, start: dict, log, stop, shake_passes, workers) -> dict:
             cand = [i for i in range(len(x)) if x[i] > 0]
             ok = [(r["cost"] - ry["cost"], i) for i, ry in zip(cand, fmany([step(x, i, -1) for i in cand]))
                   if ry["ok"] and ry["cost"] < r["cost"]]
-            if not ok:
+            i = next((i for _, i in sorted(ok, reverse=True)       # largest saving that passes every combination
+                      if not screen["on"] or f(step(x, i, -1))["ok"]), None)
+            if i is None:
                 break
-            _, i = max(ok)
             x, r = step(x, i, -1), f(step(x, i, -1))
             while True:                                                   # line search downwards (parallel)
                 ys = ahead(x, i, -1)
-                n_ok = 0
+                n_ok, last = 0, (x, r)
                 for y, ry in zip(ys, fmany(ys)):
                     if not (ry["ok"] and ry["cost"] < r["cost"]):
                         break
                     x, r, n_ok = y, ry, n_ok + 1
+                if r.get("screened"):                                     # confirm with every combination;
+                    rf = f(x)                                             # if it fails, step back one at a time
+                    while not rf["ok"] and tuple(x) != tuple(last[0]):
+                        x = step(x, i, 1)
+                        rf, n_ok = f(x), 0
+                    r = rf
                 if not ys or n_ok < len(ys):
                     break
             log(f"  trim    {r['weight']:8.1f} kg  max D/C {r['max_ratio']:.3f}  ({vlabel(var[i])})")
@@ -1191,8 +1247,10 @@ def _search(inp: dict, start: dict, log, stop, shake_passes, workers) -> dict:
             pool.shutdown(cancel_futures=True)
     design = decode(inp, var, x, start)
     r = evaluate(inp, design)                                             # with model, for drawing/export
-    log(f"done: {r['weight']:.1f} kg ({r['stiffeners']['n']} stiffeners), max D/C {r['max_ratio']:.3f}, {len(memo)} analyses, {time.time() - t0:.0f} s")
-    return dict(design=design, result=r, evals=len(memo), seconds=time.time() - t0)
+    scr = f" + {len(smemo)} screened ({len(screen['active'])} of {len(uls_all)} ULS combinations)" if screen["on"] else ""
+    log(f"done: {r['weight']:.1f} kg ({r['stiffeners']['n']} stiffeners), max D/C {r['max_ratio']:.3f}, {len(memo)} analyses"
+        f"{scr}, {time.time() - t0:.0f} s")
+    return dict(design=design, result=r, evals=len(memo), screened=len(smemo), seconds=time.time() - t0)
 
 
 # ============================================================================= STAAD

@@ -168,8 +168,16 @@ assert len(mc.crane_variants()) == 8
 assert sum(1 for c in mc.uls if any(lc in mc.lc_cl for lc, _ in c["pairs"])) == 8 * (2 + 4 * len(mc.lc_wl))
 rc = o.evaluate(C, dC)
 assert {x["check"] for x in rc["rows"] if x["line"].startswith("K1")} == {"crane drift H/200", "rail spread 10mm"}
+# combination screening (search): every combination = the full check; a subset can only report less
+gov = {x["lc"] for x in rc["rows"] if x["lc"] in {c["lc"] for c in mc.uls}}
+r_all = o.evaluate(C, dC, only=frozenset(c["lc"] for c in mc.uls))
+r_gov = o.evaluate(C, dC, only=frozenset(gov))
+assert r_all["screened"] and not rc["screened"]
+assert abs(r_all["max_ratio"] - rc["max_ratio"]) < 1e-12 and abs(r_all["viol"] - rc["viol"]) < 1e-12
+assert abs(r_gov["max_ratio"] - rc["max_ratio"]) < 1e-9          # the governing combinations reproduce it
+assert r_gov["viol"] <= rc["viol"] + 1e-9
 print(f"crane: Rmax {R['Rmax']:.1f} kN, Rmin {R['Rmin']:.1f} kN, surge {R['H']:.2f} kN per bracket; "
-      f"{len(mc.uls)} ULS combinations")
+      f"{len(mc.uls)} ULS combinations, {len(gov)} govern (screening exact on them)")
 # 11. STAAD export carries the design parameters (IS800 LSD block, deflection check), STAAD line length
 with tempfile.TemporaryDirectory() as td:
     ps = o.export_std(C, dC, td, log=lambda s: None)
