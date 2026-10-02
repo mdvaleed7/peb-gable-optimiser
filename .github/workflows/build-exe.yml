@@ -1,0 +1,27 @@
+name: build-exe
+
+# Windows packages via build_exe.py (PyInstaller): the frozen exe is self-tested before zipping.
+# Run from the Actions tab (Run workflow) or by pushing a tag v*; download the zips from the run's artifacts.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: python -m pip install -r requirements.txt pyinstaller
+      - name: build + frozen self-test + zip
+        run: python build_exe.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PEB_Gable_Optimiser_packages
+          path: |
+            dist/PEB_Gable_Optimiser_win64.zip
+            dist/PEB_Gable_Optimiser_source.zip
+          retention-days: 30

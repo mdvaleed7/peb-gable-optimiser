@@ -18,7 +18,7 @@ import PyInstaller.__main__
 HERE = Path(__file__).parent
 NAME = "PEB_Gable_Optimiser"
 DATA = ["tubes_is4923.json", "angles_is808.json"]
-SOURCE = ["app.py", "optimiser.py", "peb_frame_model.py", "is800.py", "requirements.txt", "run_app.bat", "README.md",
+SOURCE = ["app.py", "optimiser.py", "peb_frame_model.py", "is800.py", "banded.py", "requirements.txt", "run_app.bat", "README.md",
           "test_optimiser.py", "test_model.py", "build_exe.py"] + DATA
 GUIDE = """PEB Gable Optimiser - IS 800:2007 (tapered PEB frame vs portal truss)
 
