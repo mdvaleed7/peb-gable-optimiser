@@ -178,6 +178,14 @@ assert abs(r_gov["max_ratio"] - rc["max_ratio"]) < 1e-9          # the governing
 assert r_gov["viol"] <= rc["viol"] + 1e-9
 print(f"crane: Rmax {R['Rmax']:.1f} kN, Rmin {R['Rmin']:.1f} kN, surge {R['H']:.2f} kN per bracket; "
       f"{len(mc.uls)} ULS combinations, {len(gov)} govern (screening exact on them)")
+# fully stressed truss sizing: from the forces of the seed, every truss member passes after sizing
+Ts = o.scheme_input(C, "truss")
+d_seed = o.compatible(Ts, {t: Ts["templates"][t] for t in o.active_templates(Ts)})
+d_fsd = o.size_truss(Ts, d_seed)
+r_fsd = o.evaluate(Ts, d_fsd)
+tr_max = max(x["ratio"] for x in r_fsd["rows"] if x["member"] and r_fsd["model"].mem_index.get(x["member"], {}).get("sec"))
+assert tr_max <= Ts["limits"]["dc_target"] + 1e-9, tr_max
+print(f"truss sizing: seed {d_seed['truss']['ext']} -> {d_fsd['truss']['ext']}, truss members max D/C {tr_max:.3f}")
 # 11. STAAD export carries the design parameters (IS800 LSD block, deflection check), STAAD line length
 with tempfile.TemporaryDirectory() as td:
     ps = o.export_std(C, dC, td, log=lambda s: None)

@@ -112,6 +112,16 @@ scheme, 0 = none) stops the search and keeps the best feasible design found. Eac
 thread (OpenBLAS, Intel MKL as in Anaconda, OpenMP, Accelerate - all forced to 1): a multithreaded BLAS in every
 worker oversubscribes the CPU, measured 100x slower (4 workers x 4 threads) - the likely cause of day-long runs.
 
+**Engine speed** (crane demo, 238 ULS combinations, 2 worker processes): the stiffness is factorised banded
+(`banded.py`: reverse Cuthill-McKee order, LAPACK banded Cholesky) - once for all primary load cases and once per
+P-Delta iteration - instead of dense; the IS 800 station checks of many combinations run vectorised (`ratios_v`,
+`tube_ratios_v`, `angle_ratios_v`, equal to the scalar checks to 1e-12, tested in `is800.py`); lambda_cr (reported,
+not a design check) is computed for the final design only. Every ratio and lambda_cr unchanged (1.3e-10); one
+full check 0.75-1.5 s -> 0.3-0.5 s; PEB scheme 478 s -> 211 s, SHS truss 559 s -> 245 s, angle truss 506 s ->
+224 s, same designs. `options.truss_sizing` (off by default): the search sizes the truss sections fully stressed
+(`size_truss`, every station and combination, Table 3, joint width rule) at the start and whenever trimming
+stalls; measured: angle truss 224 s -> 179 s but 4568.2 -> 4580.6 kg, SHS truss no gain - kept as an option.
+
 **Optimisation problem** (full statement in the optimiser.py docstring):
 min f(x) = steel weight + stiffener mass + penalty x n_stiffeners, over catalogue indices x
 s.t. IS 800 D/C <= eta at every station and combination; SLS ratios <= 1; stiffener F/Fqd <= 1;

@@ -170,7 +170,9 @@ DEFAULT_INPUT = dict(
                  end_posts=False,        # True: 8.5.2(b) end posts let knee / haunch panels use tension field
                  constant_bf=True,       # practical: one flange width per template (member)
                  rafter_six_sections=True,   # six tapered sections from the moment envelope, shape rules
-                 screen_combos=True),        # search screens with the governing ULS combinations (> 40 combinations)
+                 screen_combos=True,         # search screens with the governing ULS combinations (> 40 combinations)
+                 truss_sizing=False),        # truss sections sized fully stressed in the search (size_truss); crane
+                                             # demo: angle truss 20 % faster but 0.3 % heavier, SHS truss no gain
     limits=dict(dc_target=1.0, rafter_defl=180.0, eave_drift=150.0, crane_drift=200.0, rail_spread_mm=10.0,
                 taper_max=150.0,      # mm depth change per m, six-section segments outside the haunch segment
                 time_limit_min=60.0),  # per scheme: stop and keep the best feasible design found (0 = no limit)
@@ -760,6 +762,79 @@ def _truss_rows(mdl: FrameModel, inp: dict, pts: dict, Ls: dict, pts_all: dict |
     return rows
 
 
+def size_truss(inp: dict, design: dict, r: dict | None = None, rounds: int = 4, log=None) -> dict:
+    """Fully stressed sizing of the truss sections: from the member forces of a full check, each (side, role)
+    group takes the lightest catalogue section that passes every station and ULS combination of its members
+    (the same IS 800 checks and Table 3 slenderness as _truss_rows, D/C target included); tubes then keep the
+    joint rule 0.35 <= b_web / b_chord <= 1. Forces are re-computed and the sizing repeated (a truss's member
+    forces depend little on its sizes) until the sections settle. Returns the design (same object if no
+    change). Columns, brackets, h0, bs and the web type are left to the search."""
+    if inp.get("scheme") != "truss" or "truss" not in design:
+        return design
+    fam = truss_family(inp)
+    if fam == "angle":
+        CAT["angle"] = [d["name"] for d in angle_chain(float(inp["fy"]), gusset(inp))]
+    cat = CAT[fam]
+    secs = [sec_props(inp, n) for n in cat]
+    fy, fu, target = float(inp["fy"]), float(inp.get("fu", 490.0)), inp["limits"]["dc_target"]
+    for _ in range(rounds):
+        r = r if r and "ends" in r else evaluate(inp, design, buckling=False)
+        if "model" not in r:
+            break
+        mdl, E2, mids = r["model"], r["ends"], r["mids"]
+        Ls = restraint_lengths(mdl, int(inp["restraint"]["fly_every"]), *_truss_lengths(inp))
+        wind = {c["lc"] for c in mdl.uls if any(lc in mdl.lc_wl for lc, _ in c["pairs"])}
+        col = {mid: i for i, mid in enumerate(mids)}
+        groups = {}
+        for m in mdl.members:
+            if not m.get("sec"):
+                continue
+            ln = mdl.lines[m["line"]]
+            role = {"raf": "top", "bot": "bot"}.get(ln["type"], ln["kind"])
+            groups.setdefault((ln["side"], role), []).append(m)
+        T = copy.deepcopy(design["truss"])
+        for (sd, role), ms in groups.items():
+            dem = []                                       # per member: N, V, M of every station and combination
+            for m in ms:
+                i = col[m["id"]]
+                pts = [(N, V, M, c["lc"]) for c in mdl.uls
+                       for _, N, V, M in end_forces_to_stations(m, E2[c["lc"]][i, 0], E2[c["lc"]][i, 1])]
+                A = np.array([p[:3] for p in pts], dtype=float)
+                tol = max(1.0, 0.02 * float(np.max(np.abs(A[:, 0])))) if len(A) else 1.0
+                comp = {p[3] for p, n in zip(pts, A[:, 0] > tol) if n}
+                lim = 180 if comp - wind else 250 if comp & wind else 400       # Table 3
+                dem.append((m, A, lim))
+
+            def passes(s):
+                for m, A, lim in dem:
+                    da = s["shape"] == "DA"
+                    cp = (angle_capacities if da else tube_capacities)(s, fy, fu, Ls[m["id"]][3], Ls[m["id"]][2])
+                    if cp["KLr"] / lim > target:
+                        return False
+                    if len(A):
+                        rr = (angle_ratios_v if da else tube_ratios_v)(cp, A[:, 0], A[:, 1], A[:, 2])
+                        if max(float(np.max(v)) for v in rr.values()) > target:
+                            return False
+                return True
+            k = next((q for q, s in enumerate(secs) if passes(s)), None)
+            if k is not None and sd in T:
+                T[sd][ROLES.index(role)] = cat[k]
+        if fam == "tube":                                  # joint rule: 0.35 b0 <= b_web <= b0, b0 = narrower chord
+            for sd in [s for s in ("ext", "int") if s in T]:
+                b0 = min(TUBE[T[sd][0]]["B"], TUBE[T[sd][1]]["B"])
+                for ri in (2, 3):
+                    cur = cat.index(T[sd][ri]) if T[sd][ri] in cat else 0
+                    ok = [q for q in range(cur, len(cat)) if 0.35 * b0 <= TUBE[cat[q]]["B"] <= b0]
+                    if ok and not 0.35 * b0 <= TUBE[T[sd][ri]]["B"] <= b0:
+                        T[sd][ri] = cat[ok[0]]
+        if T == design["truss"]:
+            break
+        if log:
+            log("  truss sizing  " + "; ".join(f"{sd}: " + " / ".join(T[sd][:4]) for sd in T if sd in ("ext", "int")))
+        design, r = {**design, "truss": T}, None
+    return design
+
+
 def _g_local(e: dict) -> np.ndarray:
     """Local geometric stiffness per unit compression (softening), [fx1 fy1 m1 fx2 fy2 m2]."""
     L, g = e["m"]["L"], np.zeros((6, 6))
@@ -1270,7 +1345,29 @@ def _search(inp: dict, start: dict, log, stop, shake_passes, workers) -> dict:
             log(f"  repair  {r['weight']:8.1f} kg  max D/C {r['max_ratio']:.3f}  violation {r['viol']:.3f}")
         return x, r
 
+    is_truss = inp.get("scheme") == "truss" and "truss" in start and inp.get("options", {}).get("truss_sizing", False)
+
+    def fsd(x):
+        """Fully stressed truss sections for the current columns / depth (size_truss), as catalogue indices."""
+        d = size_truss(inp, decode(inp, var, list(x), start), log=log)
+        return canon(encode(inp, d, var))
+
     def trim(x):
+        """Single-step trim; for a truss, when it stalls, re-size the truss sections fully stressed and go on."""
+        while True:
+            x, r = trim1(x)
+            if not is_truss or stop():
+                return x, r
+            y = fsd(x)
+            if tuple(y) == tuple(x):
+                return x, r
+            ry = f(y)
+            if not (ry["ok"] and ry["cost"] < r["cost"] - 1e-6):
+                return x, r
+            log(f"  resize  {ry['weight']:8.1f} kg  max D/C {ry['max_ratio']:.3f}  (truss sections fully stressed)")
+            x = y
+
+    def trim1(x):
         r = f(x)
         while not stop():
             cand = [i for i in range(len(x)) if x[i] > 0]
@@ -1302,6 +1399,8 @@ def _search(inp: dict, start: dict, log, stop, shake_passes, workers) -> dict:
     try:
         log(f"variables: {len(var)} (after linking {sum(len(g) for g in var)} slots) over {', '.join(tpls)}; "
             f"{workers} worker process(es)")
+        if is_truss:                                                     # start from fully stressed truss sections
+            x = fsd(x)
         x, r = repair(x)
         x, r = trim(x)
         for _ in range(shake_passes):                                     # step down + repair, keep if lighter
