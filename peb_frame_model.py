@@ -1051,8 +1051,10 @@ class LinearFrame2D:
                     fef[it[1]] += fe
                     F[e["idx"]] -= e["T"].T @ fe
         u = np.zeros(self.ndof)
-        Kff = self.K[np.ix_(self.free, self.free)]
-        u[self.free] = np.linalg.solve(Kff, F[self.free])
+        if getattr(self, "solver", None):              # factorised once by the caller (banded Cholesky)
+            u[self.free] = self.solver(F[self.free])
+        else:
+            u[self.free] = np.linalg.solve(self.K[np.ix_(self.free, self.free)], F[self.free])
         R = self.K @ u - F
         ends = {}
         for e in self.el:

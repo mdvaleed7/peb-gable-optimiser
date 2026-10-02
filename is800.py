@@ -47,6 +47,8 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
+
 from peb_frame_model import E_STEEL, POISSON, RHO_STEEL, Plates, i_section
 
 G_STEEL = E_STEEL / (2 * (1 + POISSON))
@@ -265,6 +267,49 @@ def ratios(c: dict, N: float, V: float, M: float) -> dict:
         buckling_z=nz + Kz * Ma / Mltb)                     # 9.3.2.2 (b), Cmz = 1
 
 
+def ratios_v(c: dict, N, V, M) -> dict:
+    """ratios() (with the 8.2.1.1(a) flanges-only branch) for arrays of combinations at one station (numpy)."""
+    eps, f = c["eps"], c["f"]
+    N, V, M = np.asarray(N, float), np.asarray(V, float), np.asarray(M, float)
+    pos = M >= 0
+    flange = np.where(pos, c["flange_in"], c["flange_out"])
+    P = np.maximum(N, 0.0)
+    r2 = P / c["A"] / (f / GM0)
+    web3 = np.maximum(126 * eps / (1 + 2 * r2), 42 * eps)
+    web2 = np.maximum(105 * eps / (1 + 1.5 * r2), 42 * eps)
+    web = c["d"] / c["tw"] / web3
+    Vd = (np.array([shear_capacity(c, n, m) for n, m in zip(N, M)]) if c["tf"] else np.full(N.shape, c["Vd"]))
+    Va, Ma = np.abs(V), np.abs(M)
+    slender = np.maximum(0.0 if c["slender_web"] else web, flange / (13.6 * eps))
+    plastic = (c["d"] / c["tw"] <= web2) & (flange <= 9.4 * eps)
+    Md = np.where(plastic, c["Zp"], c["Ze"]) * f / GM0
+    beta = (2 * Va / Vd - 1) ** 2
+    Md = np.where(Va > 0.6 * Vd, np.minimum(Md - beta * np.maximum(Md - c["Mfd"], 0.0), 1.2 * c["Ze"] * f / GM0), Md)
+    lt = c["ltb"]
+    Mltb = np.minimum(np.where(plastic, np.where(pos, lt["plastic"]["inner"], lt["plastic"]["outer"]),
+                               np.where(pos, lt["elastic"]["inner"], lt["elastic"]["outer"])), Md)
+    nz = P / c["Pdz"]
+    Kz = np.minimum(1 + (c["lam_z"] - 0.2) * nz, 1 + 0.8 * nz)
+    out = dict(cls=slender, shear=Va / Vd, section=np.abs(N) / c["Nd"] + Ma / Md, buckling_y=P / c["Pdy"] + Ma / Mltb,
+               buckling_z=nz + Kz * Ma / Mltb)
+    if c["slender_web"]:
+        fl = web > 1                                       # slender web -> 8.2.1.1(a) flanges only
+        if fl.any():
+            Ac = np.where(pos, c["Af_in"], c["Af_out"])
+            At = np.where(pos, c["Af_out"], c["Af_in"])
+            Fm = Ma / c["hf"]
+            Fc, Ft = N * Ac / (Ac + At) + Fm, N * At / (Ac + At) - Fm
+            fd = f / GM0
+            Ml = np.minimum(np.where(pos, c["ltb_f"]["inner"], c["ltb_f"]["outer"]), c["Mfd"])
+            nzf = P / c["Pdz_f"]
+            Kzf = np.minimum(1 + (c["lam_z"] - 0.2) * nzf, 1 + 0.8 * nzf)
+            alt = dict(cls=np.maximum(c["d"] / c["tw"] / c["web86"], flange / (13.6 * eps)), shear=Va / Vd,
+                       section=np.maximum(np.abs(Fc) / (Ac * fd), np.abs(Ft) / (At * fd)),
+                       buckling_y=P / c["Pdy_f"] + Ma / Ml, buckling_z=nzf + Kzf * Ma / Ml)
+            out = {k: np.where(fl, alt[k], out[k]) for k in out}
+    return out
+
+
 GM1 = 1.25                                                      # Table 5, ultimate stress
 CURVE_TUBE = "b"                                                # Table 10: hollow section, cold formed (IS 4923)
 
@@ -303,6 +348,24 @@ def tube_ratios(c: dict, N: float, V: float, M: float) -> dict:
     Kz = min(1 + (c["lam_z"] - 0.2) * nz, 1 + 0.8 * nz)
     return dict(cls=max(c["b_t"] / (42 * eps), c["d_t"] / web3), shear=V / c["Vd"], tension=max(-N, 0.0) / c["Td"],
                 section=abs(N) / c["Nd"] + Ma / Md, buckling_y=P / c["Pdy"] + Ma / Md, buckling_z=nz + Kz * Ma / Md)
+
+
+def tube_ratios_v(c: dict, N, V, M) -> dict:
+    """tube_ratios() for arrays of stations / combinations at once (same formulas, numpy)."""
+    eps, f = c["eps"], c["f"]
+    N, V, M = np.asarray(N, float), np.abs(np.asarray(V, float)), np.abs(np.asarray(M, float))
+    P = np.maximum(N, 0.0)
+    r2 = P / c["Nd"]
+    web3 = np.maximum(126 * eps / (1 + 2 * r2), 42 * eps)
+    web2 = np.maximum(105 * eps / (1 + 1.5 * r2), 42 * eps)
+    plastic = (c["b_t"] <= 33.5 * eps) & (c["d_t"] <= web2)
+    Md = np.where(plastic, c["Zp"], c["Ze"]) * f / GM0
+    Md = np.where(V > 0.6 * c["Vd"], Md * (1 - (2 * V / c["Vd"] - 1) ** 2), Md)
+    nz = P / c["Pdz"]
+    Kz = np.minimum(1 + (c["lam_z"] - 0.2) * nz, 1 + 0.8 * nz)
+    return dict(cls=np.maximum(c["b_t"] / (42 * eps), c["d_t"] / web3), shear=V / c["Vd"],
+                tension=np.maximum(-N, 0.0) / c["Td"], section=np.abs(N) / c["Nd"] + M / Md,
+                buckling_y=P / c["Pdy"] + M / Md, buckling_z=nz + Kz * M / Md)
 
 
 CURVE_ANGLE = "c"                                               # Table 10: angle / channel / T -> c
@@ -350,6 +413,20 @@ def angle_ratios(c: dict, N: float, V: float, M: float) -> dict:
     cls = max(c["b_t"] / (15.7 * eps), 2 * c["b_t"] / (25 * eps) if P > 0 else 0.0)
     return dict(cls=cls, shear=V / c["Vd"], tension=max(-N, 0.0) / c["Td"], section=abs(N) / c["Nd"] + Ma / Md,
                 buckling_y=P / c["Pdy"] + Ma / Md, buckling_z=nz + Kz * Ma / Md)
+
+
+def angle_ratios_v(c: dict, N, V, M) -> dict:
+    """angle_ratios() for arrays of stations / combinations at once (same formulas, numpy)."""
+    eps = c["eps"]
+    N, V, M = np.asarray(N, float), np.abs(np.asarray(V, float)), np.abs(np.asarray(M, float))
+    P = np.maximum(N, 0.0)
+    Md = c["Ze"] * c["f"] / GM0
+    Md = np.where(V > 0.6 * c["Vd"], Md * (1 - (2 * V / c["Vd"] - 1) ** 2), Md)
+    nz = P / c["Pdz"]
+    Kz = np.minimum(1 + (c["lam_z"] - 0.2) * nz, 1 + 0.8 * nz)
+    cls = np.maximum(c["b_t"] / (15.7 * eps), np.where(P > 0, 2 * c["b_t"] / (25 * eps), 0.0))
+    return dict(cls=cls, shear=V / c["Vd"], tension=np.maximum(-N, 0.0) / c["Td"], section=np.abs(N) / c["Nd"] + M / Md,
+                buckling_y=P / c["Pdy"] + M / Md, buckling_z=nz + Kz * M / Md)
 
 
 def _flanges_only(c: dict, N: float, V: float, M: float, flange: float) -> dict:
@@ -469,4 +546,19 @@ if __name__ == "__main__":
     assert abs(cda["Pdz"] - chi(lam, 0.49) * da["A"] * 250e3 / 1.1) < 1e-9                  # curve c
     ra = angle_ratios(cda, 10.0, 0, 0)
     assert abs(ra["cls"] - 2 * 65 / 8 / 25) < 1e-9 and ra["cls"] < 1                          # (b+d)/t = 16.25 < 25
+    # vectorised checks (used for many combinations at once) = the scalar ones, every branch
+    rng = np.random.default_rng(7)
+    Nv, Vv, Mv = rng.uniform(-400, 400, 300), rng.uniform(-300, 300, 300), rng.uniform(-500, 500, 300)
+    thin = Plates(0.004, 0.2, 0.010, 0.18, 0.008)                         # slender 4 mm web, unequal flanges
+    for cv in (capacities(0.9, thin, 345.0, 1.5, 3.0, 1.5, 6.0),
+               capacities(0.9, thin, 345.0, 1.5, 3.0, 1.5, 6.0, slender_web=True),
+               capacities(0.9, thin, 345.0, 1.5, 3.0, 1.5, 6.0, slender_web=True, c=1.0, tension_field=True),
+               ct, cda):
+        sc = ratios if "ltb" in cv else angle_ratios if "Zp" not in cv else tube_ratios
+        vf = ratios_v if "ltb" in cv else angle_ratios_v if "Zp" not in cv else tube_ratios_v
+        rv = vf(cv, Nv, Vv, Mv)
+        for i in range(len(Nv)):
+            rs = sc(cv, Nv[i], Vv[i], Mv[i])
+            assert list(rs) == list(rv)
+            assert all(abs(rs[k] - rv[k][i]) <= 1e-12 * max(1.0, abs(rs[k])) for k in rs), (i, rs)
     print("is800 self-check OK", {k: round(v, 3) for k, v in r2.items()})

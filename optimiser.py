@@ -69,10 +69,15 @@ try:                                                  # numpy already loaded by 
     threadpool_limits(1)
 except ImportError:
     pass
-from scipy.linalg import LinAlgError, cho_factor, cho_solve, eigh  # noqa: E402
+from scipy.linalg import LinAlgError, eigh  # noqa: E402
+from scipy.sparse import csr_matrix  # noqa: E402
+from scipy.sparse.linalg import ArpackError, ArpackNoConvergence, LinearOperator, eigsh  # noqa: E402
 
-from is800 import (GM0, angle_capacities, angle_ratios, capacities, double_angle, end_post, ratios, shear_capacity,
-                   stiffener, stiffener_fqd, tf_weld, tube_capacities, tube_ratios, web_point_load)
+from banded import BandedSPD  # noqa: E402
+
+from is800 import (GM0, angle_capacities, angle_ratios, angle_ratios_v, capacities, double_angle, end_post, ratios,
+                   ratios_v, shear_capacity, stiffener, stiffener_fqd, tf_weld, tube_capacities, tube_ratios, tube_ratios_v,
+                   web_point_load)
 from peb_frame_model import (RHO_STEEL, Crane, FrameInput, FrameModel, LinearFrame2D, Loads, Plates, Profile, Truss,
                              WindCase, _ranges, design_wind_pressure, end_forces_to_stations)
 
@@ -338,6 +343,9 @@ def restraint_lengths(mdl: FrameModel, fly_every: int, K: float = 1.0, bot_every
 K_STIFF = (1, 2, 3)     # stiffener spacing c = sub-member length / k  (k = 1: at the purlin / girt stations)
 
 
+VEC_MIN = 24          # points per station above which the IS 800 checks run vectorised (numpy call overhead)
+
+
 def check_design(mdl: FrameModel, inp: dict, ends, disp, stiff: dict | None = None, posts=None, uls=None) -> dict:
     """ends(lc) -> {member: (start[6], end[6])} STAAD local, second order; disp(lc) -> {node: (ux, uy)} m.
     Each sub-member is one decision: k (stiffeners at spacing L/k, 0 = none) and the shear method, 8.4.2.2(a)
@@ -376,13 +384,35 @@ def check_design(mdl: FrameModel, inp: dict, ends, disp, stiff: dict | None = No
             return None
         caps = {j: capacities(ln["stations"][j]["D"], P, fy, *Ls[mid], sw, c, tf) for j in {pt[0] for pt in pts[mid]}}
         worst, vmax, vtf = {}, 0.0, math.inf
-        for j, N, V, M, lc in pts[mid]:
-            r = ratios(caps[j], N, V, M)
-            chk = max(r, key=r.get)
-            if j not in worst or r[chk] > worst[j]["ratio"]:
-                worst[j] = dict(line=m["line_name"], member=mid, j=j, D_mm=round(ln["stations"][j]["D"] * 1000),
-                                check=chk, ratio=r[chk], lc=lc, N=N, V=V, M=M, stiff_k=k, tension_field=tf)
-            vmax = max(vmax, abs(V))
+        if len(pts[mid]) <= VEC_MIN * len(caps):   # few combinations (screened search): scalar checks
+            for j, N, V, M, lc in pts[mid]:
+                r = ratios(caps[j], N, V, M)
+                chk = max(r, key=r.get)
+                if j not in worst or r[chk] > worst[j]["ratio"]:
+                    worst[j] = dict(line=m["line_name"], member=mid, j=j, D_mm=round(ln["stations"][j]["D"] * 1000),
+                                    check=chk, ratio=r[chk], lc=lc, N=N, V=V, M=M, stiff_k=k, tension_field=tf)
+                vmax = max(vmax, abs(V))
+        else:                                      # every combination of a station at once (numpy)
+            Pt = np.array(pts[mid], dtype=float)
+            J = Pt[:, 0].astype(int)
+            ck, val, names = np.zeros(len(J), dtype=int), np.zeros(len(J)), None
+            for jj in caps:
+                sel = np.nonzero(J == jj)[0]
+                r = ratios_v(caps[jj], Pt[sel, 1], Pt[sel, 2], Pt[sel, 3])
+                names = names or list(r)
+                R = np.stack([r[q] for q in names])
+                ck[sel] = np.argmax(R, axis=0)     # first maximum, as max(r, key=r.get)
+                val[sel] = R[ck[sel], np.arange(len(sel))]
+            order = np.lexsort((-val, J))          # per station: largest ratio, first in point order on ties
+            first = np.r_[True, J[order][1:] != J[order][:-1]]
+            pick = {int(J[i]): int(i) for i in order[first]}
+            for jj in dict.fromkeys(J.tolist()):
+                i = pick[jj]
+                j, N, V, M, lc = pts[mid][i]
+                worst[jj] = dict(line=m["line_name"], member=mid, j=j, D_mm=round(ln["stations"][j]["D"] * 1000),
+                                 check=names[ck[i]], ratio=float(val[i]), lc=lc, N=N, V=V, M=M, stiff_k=k,
+                                 tension_field=tf)
+            vmax = float(np.max(np.abs(Pt[:, 2])))
         if tf:                                     # tension-field shear is not monotone in N, M: all combinations
             vtf = min(shear_capacity(caps[j], N, M) for j, N, V, M, lc in pts_all[mid])
         trials[key] = t = dict(member=mid, k=k, tf=tf, c=c, sd=sd, caps=caps, worst=worst, vmax=vmax, vtf=vtf,
@@ -512,15 +542,21 @@ def check_design(mdl: FrameModel, inp: dict, ends, disp, stiff: dict | None = No
              for t in choice.values() if t["k"] for i in range(t["k"] + 1)}
     skeys |= {an["ep_pos"] for an in anchors if an.get("end_post")}
     carry, extra, purlin_rows, pmax = {}, {}, [], [0.0, 0.0]
-    for key, prim in purlin_reactions(mdl).items():
-        Pin = Pout = 0.0
-        lin = lout = 0
-        for c in mdl.uls:
-            q = sum(f * prim.get(lc, 0.0) for lc, f in c["pairs"])
-            if -q > Pin:
-                Pin, lin = -q, c["lc"]
-            if q > Pout:
-                Pout, lout = q, c["lc"]
+    preac = purlin_reactions(mdl)
+    if preac:                              # purlin load of every ULS combination at once: Q = C (combos x cases) P
+        pkeys, plcs = list(preac), sorted({lc for d in preac.values() for lc in d})
+        li = {lc: i for i, lc in enumerate(plcs)}
+        Cm = np.zeros((len(mdl.uls), len(plcs)))
+        for a, c in enumerate(mdl.uls):
+            for lc, f in c["pairs"]:
+                if lc in li:
+                    Cm[a, li[lc]] += f
+        Q = Cm @ np.array([[preac[k].get(lc, 0.0) for k in pkeys] for lc in plcs])
+        a_in, a_out = np.argmax(-Q, axis=0), np.argmax(Q, axis=0)     # first combination reaching the extreme
+    for n_k, (key, prim) in enumerate(preac.items()):
+        Pin, Pout = max(0.0, -Q[a_in[n_k], n_k]), max(0.0, Q[a_out[n_k], n_k])
+        lin = mdl.uls[a_in[n_k]]["lc"] if Pin > 0 else 0
+        lout = mdl.uls[a_out[n_k]]["lc"] if Pout > 0 else 0
         pmax[0], pmax[1] = max(pmax[0], Pin), max(pmax[1], Pout)
         if key in skeys:
             force[key] = max(force.get(key, 0.0), Pin)                  # 8.7.5.1 with 8.7.2.5: max(Fq, Fx)
@@ -678,19 +714,37 @@ def _truss_rows(mdl: FrameModel, inp: dict, pts: dict, Ls: dict, pts_all: dict |
             continue
         mid, H, da = m["id"], round(m["sec"]["H"] * 1000), m["sec"]["shape"] == "DA"
         cp = (angle_capacities if da else tube_capacities)(m["sec"], fy, fu, Ls[mid][3], Ls[mid][2])
-        rat = angle_ratios if da else tube_ratios
+        rat = angle_ratios_v if da else tube_ratios_v
         allp = (pts_all or pts)[mid]                 # Table 3 needs every combination's sign of N
-        worst, tol = {}, max(1.0, 0.02 * max((abs(q[1]) for q in allp), default=0.0))
-        cg = cw = False
-        for j, N, V, M, lc in pts[mid]:
-            r = rat(cp, N, V, M)
-            chk = max(r, key=r.get)
-            if j not in worst or r[chk] > worst[j]["ratio"]:
-                worst[j] = dict(line=m["line_name"], member=mid, j=j, D_mm=H, check=chk, ratio=r[chk], lc=lc, N=N,
-                                V=V, M=M, stiff_k=0, tension_field=False)
-        for j, N, V, M, lc in allp:
-            if N > tol:
-                cw, cg = cw or lc in wind, cg or lc not in wind
+        worst = {}
+        if len(pts[mid]) <= VEC_MIN * 2:             # few combinations (screened search): scalar checks
+            rat_s = angle_ratios if da else tube_ratios
+            for j, N, V, M, lc in pts[mid]:
+                r = rat_s(cp, N, V, M)
+                chk = max(r, key=r.get)
+                if j not in worst or r[chk] > worst[j]["ratio"]:
+                    worst[j] = dict(line=m["line_name"], member=mid, j=j, D_mm=H, check=chk, ratio=r[chk], lc=lc,
+                                    N=N, V=V, M=M, stiff_k=0, tension_field=False)
+        else:                                        # every station and combination at once (numpy)
+            Pt = np.array(pts[mid], dtype=float)
+            r = rat(cp, Pt[:, 1], Pt[:, 2], Pt[:, 3])
+            names = list(r)
+            R = np.stack([r[k] for k in names])      # (checks, points); argmax = first maximum, as max(r, key=r.get)
+            ck = np.argmax(R, axis=0)
+            val = R[ck, np.arange(R.shape[1])]
+            J = Pt[:, 0].astype(int)
+            order = np.lexsort((-val, J))            # per station: the largest ratio, first in point order on ties
+            first = np.r_[True, J[order][1:] != J[order][:-1]]
+            pick = {int(J[i]): int(i) for i in order[first]}
+            for jj in dict.fromkeys(J.tolist()):     # stations in order of first appearance
+                i = pick[jj]
+                j, N, V, M, lc = pts[mid][i]
+                worst[jj] = dict(line=m["line_name"], member=mid, j=j, D_mm=H, check=names[ck[i]], ratio=float(val[i]),
+                                 lc=lc, N=N, V=V, M=M, stiff_k=0, tension_field=False)
+        Na = np.array([q[1] for q in allp], dtype=float)
+        tol = max(1.0, 0.02 * float(np.max(np.abs(Na)))) if len(Na) else 1.0
+        comp = {q[4] for q, n in zip(allp, Na > tol) if n}
+        cw, cg = bool(comp & wind), bool(comp - wind)
         lim = 180 if cg else 250 if cw else 400
         rows += list(worst.values()) + [dict(line=m["line_name"], member=mid, j=m["j"], D_mm=H, check=f"KL/r <= {lim}",
                                              ratio=cp["KLr"] / lim, lc=0, N=0.0, V=0.0, M=cp["KLr"], stiff_k=0,
@@ -722,10 +776,12 @@ def _fail(msg: str) -> dict:
     return dict(ok=False, weight=1e9, cost=1e9, max_ratio=99.0, viol=1e6, rows=[], error=msg)
 
 
-def evaluate(inp: dict, design: dict, only=None) -> dict:
+def evaluate(inp: dict, design: dict, only=None, buckling: bool = True) -> dict:
     """P-Delta analysis of every ULS combo + IS 800 checks. Never raises for a bad design (ratio 99).
     only: ULS combination numbers to analyse (screening in the search; the result is then 'screened' and
-    every design the search accepts is re-checked with all combinations)."""
+    every design the search accepts is re-checked with all combinations).
+    buckling: elastic lambda_cr of the gravity combinations (reported, not a design check - the P-Delta
+    analysis itself rejects an unstable frame); the search skips it, the final design gets it."""
     try:
         mdl = FrameModel(frame_input(inp, design))
     except ValueError as ex:
@@ -733,33 +789,41 @@ def evaluate(inp: dict, design: dict, only=None) -> dict:
     uls = mdl.uls if only is None else [c for c in mdl.uls if c["lc"] in only]
     fe = LinearFrame2D(mdl, shear=True)                                # web shear deformation, as STAAD
     mids = [m["id"] for m in mdl.members]
-    need = sorted({lc for c in mdl.uls + mdl.sls for lc, _ in c["pairs"]})
-    try:
-        sol = {lc: fe.solve({lc: 1.0}) for lc in need}
-    except np.linalg.LinAlgError:
-        return _fail("singular stiffness (mechanism) - check releases / connectivity")
-    U = {lc: np.array([sol[lc]["u"][nd] for nd in fe.ids]).ravel() for lc in need}      # dof order = ids
-
     free, nf = fe.free, len(fe.free)
-    Kff = fe.K[np.ix_(free, free)]
     Kl = np.array([e["k"] for e in fe.el])                              # (nm, 6, 6) local, condensed
     Gl = np.array([_g_local(e) for e in fe.el])
     Tm = np.array([e["T"] for e in fe.el])
     idx = np.array([e["idx"] for e in fe.el])
     pos = {d: i for i, d in enumerate(free)}
-    gv, gi = [], []                                                     # sparse global Kg per unit N
+    gv, ga, gb = [], [], []                                             # global Kg per unit N, element blocks
     for i, e in enumerate(fe.el):
         gg = Tm[i].T @ Gl[i] @ Tm[i]
         keep = [a for a in range(6) if idx[i, a] in pos]
         gv.append([gg[a, b] for a in keep for b in keep])
-        gi.append([pos[idx[i, a]] * nf + pos[idx[i, b]] for a in keep for b in keep])
+        ga.append([pos[idx[i, a]] for a in keep for b in keep])
+        gb.append([pos[idx[i, b]] for a in keep for b in keep])
     g_el = np.repeat(np.arange(len(fe.el)), [len(v) for v in gv])
-    gv, gi = np.concatenate(gv), np.concatenate(gi)
+    gv, ga, gb = np.concatenate(gv), np.concatenate(ga).astype(np.intp), np.concatenate(gb).astype(np.intp)
+    # Banded Cholesky in reverse Cuthill-McKee order (the element blocks give the pattern of K and Kg):
+    # K factorised once for every primary load case; K - Kg(N) once per P-Delta iteration.
+    B = BandedSPD(nf, ga, gb)
+    kp = np.unique(ga * nf + gb)
+    kr, kc = kp // nf, kp % nf
+    Kv = fe.K[free[kr], free[kc]]
+    Kband = B.band(Kv, B.scatter(kr, kc))
+    flatG, size = B.scatter(ga, gb), Kband.size
+    keepG = flatG >= 0
 
-    def kg(N):
-        out = np.zeros(nf * nf)
-        np.add.at(out, gi, N[g_el] * gv)
-        return out.reshape(nf, nf)
+    def kband(N):                                                       # band of K - Kg(N)
+        return Kband - np.bincount(flatG[keepG], weights=(N[g_el] * gv)[keepG], minlength=size).reshape(Kband.shape)
+    try:
+        fK = B.factor(Kband)
+    except LinAlgError:
+        return _fail("singular stiffness (mechanism) - check releases / connectivity")
+    fe.solver = lambda b: B.solve(fK, b)
+    need = sorted({lc for c in mdl.uls + mdl.sls for lc, _ in c["pairs"]})
+    sol = {lc: fe.solve({lc: 1.0}) for lc in need}
+    U = {lc: np.array([sol[lc]["u"][nd] for nd in fe.ids]).ravel() for lc in need}      # dof order = ids
 
     def local(u):                                                       # element local displacements
         return np.einsum("eij,ej->ei", Tm, u[idx])
@@ -770,7 +834,7 @@ def evaluate(inp: dict, design: dict, only=None) -> dict:
         return out
 
     uls_prim = sorted({lc for c in uls for lc, _ in c["pairs"]})
-    Ff = {lc: Kff @ U[lc][free] for lc in uls_prim}
+    Ff = {lc: B.matvec_band(Kband, U[lc][free]) for lc in uls_prim}
     FEF = {}
     for lc in uls_prim:
         f = np.array([sol[lc]["ends"][mid] for mid in mids])[:, :, [0, 1, 5]].reshape(-1, 6)
@@ -780,23 +844,33 @@ def evaluate(inp: dict, design: dict, only=None) -> dict:
         F = sum(f * Ff[lc] for lc, f in c["pairs"])
         fef = sum(f * FEF[lc] for lc, f in c["pairs"])
         N = np.zeros(len(mids))                                         # first pass = first order
-        for _ in range(10):
+        for it in range(10):
             try:
-                cf = cho_factor(Kff - kg(N))
+                cf = B.factor(kband(N)) if it else fK
             except LinAlgError:
                 return _fail(f"unstable under {c['title']} (lambda_cr < 1)")
             u = np.zeros(fe.ndof)
-            u[free] = cho_solve(cf, F)
+            u[free] = B.solve(cf, F)
             f = np.einsum("eij,ej->ei", Kl - N[:, None, None] * Gl, local(u)) + fef
             if np.max(np.abs(f[:, 0] - N)) < 1e-3 * max(1.0, np.max(np.abs(N))):
                 break
             N = f[:, 0]
         E2[c["lc"]] = to_ends(f)
     lam = {}
+    Ksp = Kinv = None
     for c in uls:                                                       # K phi = lambda Kg phi
-        if c["gravity_only"]:
+        if c["gravity_only"] and only is None and buckling:             # reported only, not a design check
             N = E2[c["lc"]][:, 0, 0]
-            mu = eigh(kg(N), Kff, eigvals_only=True, subset_by_index=[nf - 1, nf - 1])[0]
+            G = csr_matrix((N[g_el] * gv, (ga, gb)), shape=(nf, nf))
+            if Ksp is None:
+                Ksp = csr_matrix((Kv, (kr, kc)), shape=(nf, nf))
+                Kinv = LinearOperator((nf, nf), matvec=fe.solver, dtype=float)
+            try:                                                        # largest mu of Kg phi = mu K phi (Lanczos)
+                mu = eigsh(G, k=1, M=Ksp, Minv=Kinv, which="LA", tol=1e-12, ncv=min(nf - 1, 24),
+                           return_eigenvectors=False)[0]
+            except (ArpackNoConvergence, ArpackError):
+                Kff = fe.K[np.ix_(free, free)]
+                mu = eigh(G.toarray(), Kff, eigvals_only=True, subset_by_index=[nf - 1, nf - 1])[0]
             lam[c["lc"]] = 1 / mu if mu > 1e-12 else math.inf
     cmap = {c["lc"]: c for c in mdl.sls}
 
@@ -1057,7 +1131,7 @@ def decode(inp: dict, var: list, x: list, T: dict | None = None) -> dict:
 def _eval_stripped(args):
     """Worker: evaluate without the (unpicklable-heavy) model object."""
     inp, design, only = args
-    r = evaluate(inp, design, only)
+    r = evaluate(inp, design, only, buckling=False)
     for k in ("model", "ends", "mids"):
         r.pop(k, None)
     return r
